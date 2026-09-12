@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -9,14 +10,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import DATABASE_PATH, connect, init_db, row_dict
-from .schemas import BackupRestoreRequest, BatchReportRequest, CandidateCreate, CandidatePatch, CriterionCreate, CriterionPatch, EvidenceCopyRequest, EvidenceCreate, EvidencePatch, ImportRequest, ReviewCreate, TaskCreate, TaskPatch, TaskTemplateCreate, TaskTemplateInstantiate
+from .schemas import BackupRestoreRequest, BatchReportRequest, CandidateCreate, CandidatePatch, CriterionCreate, CriterionPatch, EvidenceCopyRequest, EvidenceCreate, EvidencePatch, ImportRequest, ReviewCreate, RumEvent, TaskCreate, TaskPatch, TaskTemplateCreate, TaskTemplateInstantiate
 from .services.evaluator import evaluate
 from .services.backup import BackupError, export_backup, restore_backup
 from .services.evidence_files import copy_evidence_file
@@ -26,6 +27,9 @@ from .services.reports import render_html, render_markdown
 from .services.audit import audit_row, record_audit
 from .services.security import FixedWindowLimiter, add_security_headers
 from .settings import AppSettings
+from .auth import authenticate_request, current_principal, reset_principal, revoke_session, revoke_user_sessions, set_principal
+from .permissions import require_task_role, set_task_membership
+from .services.rate_limit import RateLimitBackendUnavailable, RedisRateLimiter, create_redis_limiter
 
 
 @asynccontextmanager
@@ -40,6 +44,10 @@ configured_origins = [item.strip() for item in os.getenv("TASK_EVIDENCE_CORS_ORI
 app.add_middleware(CORSMiddleware, allow_origins=configured_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 request_limiter = FixedWindowLimiter(limit=120, window_seconds=60)
+redis_limiter: RedisRateLimiter | None = None
+redis_limiter_url: str | None = None
+request_metrics: dict[str, int] = {}
+logger = logging.getLogger("task_evidence_lab.api")
 
 
 def _security_headers(response: JSONResponse | Any, request) -> Any:
@@ -48,11 +56,52 @@ def _security_headers(response: JSONResponse | Any, request) -> Any:
 
 @app.middleware("http")
 async def local_security_middleware(request, call_next):
+    request_id = request.headers.get("X-Request-ID", "").strip() or secrets.token_hex(16)
+    request.state.request_id = request_id
     is_api = request.url.path.startswith("/api/") and request.url.path != "/api/health"
+    is_metrics = request.url.path == "/metrics"
+    principal_token = None
+    session_token = None
+    if settings.profile == "production" and (is_api or is_metrics) and request.url.path not in {"/api/ready"}:
+        with connect() as connection:
+            principal, session_token = authenticate_request(request, connection, settings)
+            if principal and session_token:
+                record_audit(connection, action="auth.session_created", entity_type="session", entity_id=principal.get("session_id"), detail={"subject": principal.get("subject")}, request_id=request_id)
+        if not principal:
+            response = _security_headers(JSONResponse(status_code=401, content={"detail": "需要有效的登录会话"}), request)
+            response.headers["X-Request-ID"] = request_id
+            return response
+        principal_token = set_principal(principal)
+        if settings.redis_url:
+            try:
+                global redis_limiter, redis_limiter_url
+                if redis_limiter is None or redis_limiter_url != settings.redis_url:
+                    redis_limiter = create_redis_limiter(settings.redis_url, prefix=settings.redis_prefix)
+                    redis_limiter_url = settings.redis_url
+                category = "write" if request.method in {"POST", "PATCH", "PUT", "DELETE"} else "read"
+                identity = str(current_principal().get("id") or (request.client.host if request.client else "unknown"))
+                limit = 60 if category == "write" else 120
+                if not redis_limiter.allow(f"{category}:{identity}:{request.url.path}", limit=limit, window_seconds=60):
+                    response = JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后重试"})
+                    response.headers["Retry-After"] = "60"
+                    response = _security_headers(response, request)
+                    response.headers["X-Request-ID"] = request_id
+                    return response
+            except RateLimitBackendUnavailable:
+                if settings.redis_required:
+                    response = _security_headers(JSONResponse(status_code=503, content={"detail": "限流服务暂不可用"}), request)
+                    response.headers["X-Request-ID"] = request_id
+                    return response
+        elif settings.redis_required:
+            response = _security_headers(JSONResponse(status_code=503, content={"detail": "生产环境未配置限流服务"}), request)
+            response.headers["X-Request-ID"] = request_id
+            return response
     if is_api:
         expected_key = os.getenv("TASK_EVIDENCE_API_KEY", "").strip()
         if expected_key and not secrets.compare_digest(request.headers.get("X-API-Key", ""), expected_key):
-            return _security_headers(JSONResponse(status_code=401, content={"detail": "缺少或无效的 API Key"}), request)
+            response = _security_headers(JSONResponse(status_code=401, content={"detail": "缺少或无效的 API Key"}), request)
+            response.headers["X-Request-ID"] = request_id
+            return response
         try:
             configured_limit = int(os.getenv("TASK_EVIDENCE_RATE_LIMIT", "0") or "0")
         except ValueError:
@@ -64,8 +113,23 @@ async def local_security_middleware(request, call_next):
             if not request_limiter.allow(key):
                 response = JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后重试"})
                 response.headers["Retry-After"] = str(request_limiter.retry_after(key))
-                return _security_headers(response, request)
-    return _security_headers(await call_next(request), request)
+                response = _security_headers(response, request)
+                response.headers["X-Request-ID"] = request_id
+                return response
+    try:
+        response = await call_next(request)
+        if session_token:
+            from .services.security import session_cookie_options
+
+            response.set_cookie(settings.session_cookie_name, session_token, **session_cookie_options(settings), max_age=settings.session_absolute_seconds)
+        response = _security_headers(response, request)
+        response.headers["X-Request-ID"] = request_id
+        request_metrics[f"requests_total|{response.status_code}"] = request_metrics.get(f"requests_total|{response.status_code}", 0) + 1
+        logger.info(json.dumps({"request_id": request_id, "method": request.method, "path": request.url.path, "status": response.status_code}, ensure_ascii=False))
+        return response
+    finally:
+        if principal_token is not None:
+            reset_principal(principal_token)
 
 
 @app.exception_handler(RequestValidationError)
@@ -82,7 +146,38 @@ def get_task(connection: sqlite3.Connection, task_id: int) -> dict:
     task = row_dict(connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
     if not task:
         raise HTTPException(404, "任务不存在")
+    try:
+        require_task_role(connection, task_id, current_principal(), {"owner", "editor", "reviewer", "viewer"})
+    except PermissionError as exc:
+        raise HTTPException(403, "无权访问该任务") from exc
     return task
+
+
+def require_task_write(connection: sqlite3.Connection, task_id: int, roles: set[str] = {"owner", "editor"}) -> None:
+    try:
+        require_task_role(connection, task_id, current_principal(), roles)
+    except PermissionError as exc:
+        raise HTTPException(403, "无权修改该任务") from exc
+
+
+def require_admin() -> None:
+    if settings.profile == "production" and current_principal().get("global_role") != "admin":
+        raise HTTPException(403, "仅管理员可执行该操作")
+
+
+def require_child_role(connection: sqlite3.Connection, table: str, child_id: int, roles: set[str]) -> sqlite3.Row:
+    if table not in {"acceptance_criteria", "evidence", "runs", "evaluations", "reviews", "memory_candidates"}:
+        raise ValueError("unsupported child table")
+    row = connection.execute(f"SELECT * FROM {table} WHERE id = ?", (child_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "关联资源不存在")
+    task_id = row["task_id"]
+    if task_id is not None:
+        try:
+            require_task_role(connection, task_id, current_principal(), roles)
+        except PermissionError as exc:
+            raise HTTPException(403, "无权访问关联资源") from exc
+    return row
 
 
 def task_payload(connection: sqlite3.Connection, task_id: int) -> dict:
@@ -110,6 +205,200 @@ def health() -> dict:
     return {"status": "ok", "service": "task-evidence-lab", "ai_enabled": False}
 
 
+@app.get("/api/ready")
+def readiness() -> JSONResponse:
+    init_db()
+    if settings.profile == "production" and settings.redis_required:
+        if not settings.redis_url:
+            return JSONResponse(status_code=503, content={"status": "not_ready", "reason": "redis_not_configured"})
+        try:
+            global redis_limiter, redis_limiter_url
+            if redis_limiter is None or redis_limiter_url != settings.redis_url:
+                redis_limiter = create_redis_limiter(settings.redis_url, prefix=settings.redis_prefix)
+                redis_limiter_url = settings.redis_url
+        except RateLimitBackendUnavailable:
+            return JSONResponse(status_code=503, content={"status": "not_ready", "reason": "redis_unavailable"})
+    return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics() -> str:
+    if settings.profile == "production" and current_principal().get("global_role") != "admin":
+        raise HTTPException(403, "仅管理员可查看监控指标")
+    lines = ["# TYPE task_evidence_http_requests_total counter"]
+    for key, value in sorted(request_metrics.items()):
+        if key.startswith("requests_total|"):
+            status = key.split("|", 1)[1]
+            lines.append(f'task_evidence_http_requests_total{{status="{status}"}} {value}')
+    return "\n".join(lines) + "\n"
+
+
+@app.post("/api/rum", status_code=202)
+def rum_event(payload: RumEvent, request: Request) -> dict:
+    logger.info(json.dumps({"event": "rum", "request_id": getattr(request.state, "request_id", None), "metric": payload.metric, "value": payload.value, "page": payload.page}, ensure_ascii=False))
+    return {"accepted": True}
+
+
+@app.get("/api/auth/me")
+def auth_me() -> dict:
+    principal = current_principal()
+    return {key: principal.get(key) for key in ("id", "issuer", "subject", "email", "display_name", "status", "global_role", "session_id")}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request) -> JSONResponse:
+    token = request.cookies.get(settings.session_cookie_name)
+    if token:
+        with connect() as connection:
+            revoke_session(connection, token, reason="logout")
+            record_audit(connection, action="auth.session_revoked", entity_type="session", detail={"reason": "logout"}, request_id=getattr(request.state, "request_id", None))
+    response = JSONResponse({"logged_out": True})
+    response.delete_cookie(settings.session_cookie_name, path="/")
+    return response
+
+
+@app.post("/api/auth/logout-all")
+def auth_logout_all() -> JSONResponse:
+    principal = current_principal()
+    if principal.get("id", 0) > 0:
+        with connect() as connection:
+            count = revoke_user_sessions(connection, principal["id"], reason="logout_all")
+            record_audit(connection, action="auth.sessions_revoked", entity_type="user", entity_id=principal["id"], detail={"reason": "logout_all", "count": count})
+    else:
+        count = 0
+    response = JSONResponse({"logged_out": True, "revoked_sessions": count})
+    response.delete_cookie(settings.session_cookie_name, path="/")
+    return response
+
+
+@app.get("/api/auth/sessions")
+def auth_sessions() -> list[dict]:
+    principal = current_principal()
+    if principal.get("id", 0) == 0:
+        return []
+    with connect() as connection:
+        return [dict(row) for row in connection.execute("SELECT id, created_at, last_seen_at, expires_at, revoked_at, revoke_reason FROM user_sessions WHERE user_id = ? ORDER BY id DESC", (principal["id"],))]
+
+
+@app.delete("/api/auth/sessions/{session_id}")
+def revoke_auth_session(session_id: int) -> dict:
+    principal = current_principal()
+    with connect() as connection:
+        cursor = connection.execute("UPDATE user_sessions SET revoked_at = ?, revoke_reason = 'manual_revoke' WHERE id = ? AND user_id = ? AND revoked_at IS NULL", (now(), session_id, principal.get("id", 0)))
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "会话不存在")
+        record_audit(connection, action="auth.session_revoked", entity_type="session", entity_id=session_id, detail={"reason": "manual_revoke"})
+    return {"revoked": True, "session_id": session_id}
+
+
+@app.get("/api/tasks/{task_id}/members")
+def list_task_members(task_id: int) -> list[dict]:
+    with connect() as connection:
+        get_task(connection, task_id)
+        return [dict(row) for row in connection.execute("SELECT users.id, users.email, users.display_name, users.status, task_memberships.role, task_memberships.created_at, task_memberships.updated_at FROM task_memberships JOIN users ON users.id = task_memberships.user_id WHERE task_memberships.task_id = ? ORDER BY task_memberships.role, users.id", (task_id,))]
+
+
+@app.post("/api/tasks/{task_id}/members", status_code=201)
+def add_task_member(task_id: int, payload: dict) -> dict:
+    with connect() as connection:
+        get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner"})
+        try:
+            user_id = int(payload["user_id"])
+            role = str(payload["role"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(422, "user_id 和 role 是必填项") from exc
+        if role not in {"owner", "editor", "reviewer", "viewer"}:
+            raise HTTPException(422, "无效的任务角色")
+        if not connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(404, "用户不存在")
+        if role == "owner":
+            existing_owner = connection.execute("SELECT 1 FROM task_memberships WHERE task_id = ? AND role = 'owner'", (task_id,)).fetchone()
+            if existing_owner:
+                raise HTTPException(409, "任务已有 owner")
+        membership = set_task_membership(connection, task_id=task_id, user_id=user_id, role=role, added_by=current_principal().get("id") or None)
+        record_audit(connection, action="task.member_added", entity_type="task_membership", entity_id=user_id, task_id=task_id, detail={"user_id": user_id, "role": role})
+        return membership
+
+
+@app.patch("/api/tasks/{task_id}/members/{user_id}")
+def patch_task_member(task_id: int, user_id: int, payload: dict) -> dict:
+    with connect() as connection:
+        get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner"})
+        role = str(payload.get("role", ""))
+        if role not in {"owner", "editor", "reviewer", "viewer"}:
+            raise HTTPException(422, "无效的任务角色")
+        existing = connection.execute("SELECT * FROM task_memberships WHERE task_id = ? AND user_id = ?", (task_id, user_id)).fetchone()
+        if not existing:
+            raise HTTPException(404, "任务成员不存在")
+        if role == "owner" and existing["role"] != "owner" and connection.execute("SELECT 1 FROM task_memberships WHERE task_id = ? AND role = 'owner'", (task_id,)).fetchone():
+            raise HTTPException(409, "任务已有 owner")
+        membership = set_task_membership(connection, task_id=task_id, user_id=user_id, role=role, added_by=current_principal().get("id") or None)
+        record_audit(connection, action="task.member_updated", entity_type="task_membership", entity_id=user_id, task_id=task_id, detail={"user_id": user_id, "role": role})
+        return membership
+
+
+@app.delete("/api/tasks/{task_id}/members/{user_id}")
+def remove_task_member(task_id: int, user_id: int) -> dict:
+    with connect() as connection:
+        get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner"})
+        membership = connection.execute("SELECT * FROM task_memberships WHERE task_id = ? AND user_id = ?", (task_id, user_id)).fetchone()
+        if not membership:
+            raise HTTPException(404, "任务成员不存在")
+        if membership["role"] == "owner":
+            raise HTTPException(422, "不能直接删除任务 owner")
+        connection.execute("DELETE FROM task_memberships WHERE task_id = ? AND user_id = ?", (task_id, user_id))
+        record_audit(connection, action="task.member_removed", entity_type="task_membership", entity_id=user_id, task_id=task_id, detail={"user_id": user_id})
+        return {"removed": True, "user_id": user_id}
+
+
+@app.get("/api/admin/users")
+def list_users() -> list[dict]:
+    require_admin()
+    with connect() as connection:
+        return [dict(row) for row in connection.execute("SELECT users.id, users.issuer, users.subject, users.email, users.display_name, users.status, users.created_at, users.updated_at, users.last_login_at, user_global_roles.role AS global_role FROM users JOIN user_global_roles ON user_global_roles.user_id = users.id ORDER BY users.id")]
+
+
+@app.patch("/api/admin/users/{user_id}")
+def patch_user(user_id: int, payload: dict) -> dict:
+    require_admin()
+    status = str(payload.get("status", ""))
+    role = str(payload.get("role", ""))
+    if status and status not in {"active", "disabled"}:
+        raise HTTPException(422, "无效的用户状态")
+    if role and role not in {"admin", "member"}:
+        raise HTTPException(422, "无效的全局角色")
+    with connect() as connection:
+        if not connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(404, "用户不存在")
+        if status:
+            connection.execute("UPDATE users SET status = ?, updated_at = ? WHERE id = ?", (status, now(), user_id))
+            if status == "disabled":
+                revoke_user_sessions(connection, user_id, reason="user_disabled")
+        if role:
+            connection.execute("UPDATE user_global_roles SET role = ? WHERE user_id = ?", (role, user_id))
+        return dict(connection.execute("SELECT users.id, users.email, users.display_name, users.status, user_global_roles.role AS global_role FROM users JOIN user_global_roles ON user_global_roles.user_id = users.id WHERE users.id = ?", (user_id,)).fetchone())
+
+
+@app.post("/api/admin/tasks/adopt-orphans")
+def adopt_orphan_tasks(payload: dict) -> dict:
+    require_admin()
+    try:
+        user_id = int(payload["user_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "user_id 是必填项") from exc
+    with connect() as connection:
+        if not connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(404, "用户不存在")
+        task_rows = connection.execute("SELECT id FROM tasks WHERE id NOT IN (SELECT task_id FROM task_memberships WHERE role = 'owner')").fetchall()
+        for row in task_rows:
+            set_task_membership(connection, task_id=row["id"], user_id=user_id, role="owner", added_by=current_principal().get("id") or None)
+        record_audit(connection, action="task.orphans_adopted", entity_type="user", entity_id=user_id, detail={"task_count": len(task_rows)})
+        return {"adopted": len(task_rows), "user_id": user_id}
+
+
 @app.get("/api/templates")
 def list_templates() -> list[dict]:
     with connect() as connection:
@@ -118,6 +407,7 @@ def list_templates() -> list[dict]:
 
 @app.post("/api/templates", status_code=201)
 def create_template(payload: TaskTemplateCreate) -> dict:
+    require_admin()
     timestamp = now()
     criteria = [item.strip()[:300] for item in payload.criteria if item.strip()]
     evidence_types = [item.strip()[:50] for item in payload.evidence_types if item.strip()]
@@ -132,6 +422,7 @@ def create_template(payload: TaskTemplateCreate) -> dict:
 
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: int) -> dict:
+    require_admin()
     with connect() as connection:
         row = connection.execute("SELECT * FROM task_templates WHERE id = ?", (template_id,)).fetchone()
         if not row:
@@ -159,6 +450,9 @@ def instantiate_template(template_id: int, payload: TaskTemplateInstantiate) -> 
             (title, description, template["priority"], template["completion_basis"], timestamp, timestamp),
         )
         task_id = task_cursor.lastrowid
+        principal = current_principal()
+        if principal.get("id", 0) > 0:
+            set_task_membership(connection, task_id=task_id, user_id=principal["id"], role="owner", added_by=principal["id"])
         for criterion in criteria:
             connection.execute("INSERT INTO acceptance_criteria(task_id, title, required, status) VALUES (?, ?, 1, 'pending')", (task_id, criterion))
         for evidence_type in evidence_types:
@@ -170,12 +464,14 @@ def instantiate_template(template_id: int, payload: TaskTemplateInstantiate) -> 
 
 @app.get("/api/backup/export")
 def backup_export() -> dict:
+    require_admin()
     with connect() as connection:
         return export_backup(connection)
 
 
 @app.post("/api/backup/restore")
 def backup_restore(payload: BackupRestoreRequest) -> dict:
+    require_admin()
     if not payload.replace:
         raise HTTPException(422, "恢复会替换当前本地数据，请显式确认 replace=true")
     with connect() as connection:
@@ -190,11 +486,12 @@ def backup_restore(payload: BackupRestoreRequest) -> dict:
 
 @app.get("/api/audit-log")
 def audit_log(limit: int = Query(default=200, ge=1, le=500), task_id: int | None = Query(default=None)) -> list[dict]:
+    require_admin()
     with connect() as connection:
         if task_id is None:
-            rows = connection.execute("SELECT id, task_id, action, entity_type, entity_id, detail_json, created_at FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = connection.execute("SELECT id, task_id, action, entity_type, entity_id, detail_json, created_at, actor_user_id, request_id, previous_hash, event_hash, redaction_version, archived_at, archive_batch_id FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         else:
-            rows = connection.execute("SELECT id, task_id, action, entity_type, entity_id, detail_json, created_at FROM audit_log WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, limit)).fetchall()
+            rows = connection.execute("SELECT id, task_id, action, entity_type, entity_id, detail_json, created_at, actor_user_id, request_id, previous_hash, event_hash, redaction_version, archived_at, archive_batch_id FROM audit_log WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, limit)).fetchall()
         return [audit_row(row) for row in rows]
 
 
@@ -204,6 +501,9 @@ def create_task(payload: TaskCreate) -> dict:
     with connect() as connection:
         cursor = connection.execute("INSERT INTO tasks(title, description, priority, due_at, completion_basis, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (payload.title, payload.description, payload.priority, payload.due_at.isoformat() if payload.due_at else None, payload.completion_basis, timestamp, timestamp))
         task_id = cursor.lastrowid
+        principal = current_principal()
+        if principal.get("id", 0) > 0:
+            set_task_membership(connection, task_id=task_id, user_id=principal["id"], role="owner", added_by=principal["id"])
         for tag in payload.tags:
             connection.execute("INSERT INTO acceptance_criteria(task_id, title, required, status) VALUES (?, ?, 0, 'pending')", (task_id, f"标签：{tag[:80]}"))
         record_audit(connection, action="task.created", entity_type="task", entity_id=task_id, task_id=task_id, detail={"title": payload.title, "priority": payload.priority}, created_at=timestamp)
@@ -220,6 +520,13 @@ def list_tasks(
 ) -> list[dict]:
     with connect() as connection:
         clauses, params = [], []
+        principal = current_principal()
+        if principal.get("global_role") != "admin":
+            if principal.get("id", 0) > 0:
+                clauses.append("tasks.id IN (SELECT task_id FROM task_memberships WHERE user_id = ?)")
+                params.append(principal["id"])
+            else:
+                clauses.append("1 = 0")
         if not include_archived:
             clauses.append("status != 'archived'")
         if status:
@@ -252,6 +559,7 @@ def patch_task(task_id: int, payload: TaskPatch) -> dict:
     values = payload.model_dump(exclude_unset=True)
     with connect() as connection:
         task = get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner"} if values.get("status") in {"archived", "deleted"} else {"owner", "editor"})
         if values.get("status") == "completed":
             required = connection.execute("SELECT status FROM acceptance_criteria WHERE task_id = ? AND required = 1", (task_id,)).fetchall()
             if not required or any(row["status"] not in ("verified", "not_applicable") for row in required):
@@ -275,6 +583,7 @@ def patch_task(task_id: int, payload: TaskPatch) -> dict:
 def delete_task(task_id: int) -> dict:
     with connect() as connection:
         task = get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner"})
         record_audit(connection, action="task.deleted", entity_type="task", entity_id=task_id, task_id=task_id, detail={"title": task["title"]})
         connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return {"deleted": True, "task_id": task_id}
@@ -284,6 +593,7 @@ def delete_task(task_id: int) -> dict:
 def create_criterion(task_id: int, payload: CriterionCreate) -> dict:
     with connect() as connection:
         get_task(connection, task_id)
+        require_task_write(connection, task_id)
         row = connection.execute("INSERT INTO acceptance_criteria(task_id, title, required) VALUES (?, ?, ?) RETURNING *", (task_id, payload.title, int(payload.required))).fetchone()
         record_audit(connection, action="criterion.created", entity_type="criterion", entity_id=row["id"], task_id=task_id, detail={"title": payload.title, "required": payload.required})
         return dict(row)
@@ -296,6 +606,7 @@ def patch_criterion(criterion_id: int, payload: CriterionPatch) -> dict:
     with connect() as connection:
         existing = connection.execute("SELECT * FROM acceptance_criteria WHERE id = ?", (criterion_id,)).fetchone()
         if not existing: raise HTTPException(404, "验收项不存在")
+        require_task_write(connection, existing["task_id"])
         if not values: return dict(existing)
         assignments = ", ".join(f"{key} = ?" for key in values)
         connection.execute(f"UPDATE acceptance_criteria SET {assignments} WHERE id = ?", [*values.values(), criterion_id])
@@ -307,6 +618,7 @@ def patch_criterion(criterion_id: int, payload: CriterionPatch) -> dict:
 def create_evidence(task_id: int, payload: EvidenceCreate) -> dict:
     with connect() as connection:
         get_task(connection, task_id)
+        require_task_write(connection, task_id)
         row = connection.execute("INSERT INTO evidence(task_id, title, evidence_type, content, file_path, external_url, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *", (task_id, payload.title, payload.evidence_type, payload.content, payload.file_path, payload.external_url, payload.source, now())).fetchone()
         record_audit(connection, action="evidence.created", entity_type="evidence", entity_id=row["id"], task_id=task_id, detail={"title": payload.title, "evidence_type": payload.evidence_type})
         return dict(row)
@@ -325,6 +637,7 @@ def patch_evidence(evidence_id: int, payload: EvidencePatch) -> dict:
     with connect() as connection:
         existing = connection.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
         if not existing: raise HTTPException(404, "证据不存在")
+        require_task_write(connection, existing["task_id"])
         if values:
             assignments = ", ".join(f"{key} = ?" for key in values)
             connection.execute(f"UPDATE evidence SET {assignments} WHERE id = ?", [*values.values(), evidence_id])
@@ -338,6 +651,7 @@ def check_evidence_link(evidence_id: int) -> dict:
         evidence = row_dict(connection.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone())
         if not evidence:
             raise HTTPException(404, "证据不存在")
+        require_task_write(connection, evidence["task_id"], {"owner", "editor", "reviewer"})
         if not evidence.get("external_url"):
             raise HTTPException(422, "该证据没有 external_url")
         try:
@@ -360,6 +674,7 @@ def copy_evidence(evidence_id: int, payload: EvidenceCopyRequest) -> dict:
         evidence = row_dict(connection.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone())
         if not evidence:
             raise HTTPException(404, "证据不存在")
+        require_task_write(connection, evidence["task_id"])
         try:
             local_path, size_bytes, sha256 = copy_evidence_file(DATABASE_PATH.parent, evidence_id, evidence["title"], payload.source_path)
         except FileNotFoundError as exc:
@@ -392,6 +707,7 @@ def import_run(payload: ImportRequest) -> dict:
     timestamp = now()
     with connect() as connection:
         get_task(connection, payload.task_id)
+        require_task_write(connection, payload.task_id)
         if connection.execute("SELECT 1 FROM runs WHERE task_id = ? AND source_hash = ?", (payload.task_id, source_hash)).fetchone():
             raise HTTPException(409, "该运行记录已导入，重复内容被拒绝")
         try:
@@ -446,7 +762,10 @@ def task_audit_log(task_id: int) -> list[dict]:
 @app.get("/api/runs/{run_id}")
 def read_run(run_id: int) -> dict:
     with connect() as connection:
-        run = row_dict(connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        raw_run = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if raw_run:
+            require_child_role(connection, "runs", run_id, {"owner", "editor", "reviewer", "viewer"})
+        run = row_dict(raw_run)
         if not run: raise HTTPException(404, "运行记录不存在")
         run["steps"] = [dict(row) for row in connection.execute("SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index", (run_id,))]
         run["tool_calls"] = [dict(row) for row in connection.execute("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY id", (run_id,))]
@@ -470,6 +789,7 @@ def report_runs(connection: sqlite3.Connection, task_id: int) -> list[dict]:
 def evaluate_task(task_id: int) -> dict:
     with connect() as connection:
         task = get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner", "editor", "reviewer"})
         criteria = [dict(row) for row in connection.execute("SELECT * FROM acceptance_criteria WHERE task_id = ?", (task_id,))]
         evidence = [dict(row) for row in connection.execute("SELECT * FROM evidence WHERE task_id = ?", (task_id,))]
         runs = [dict(row) for row in connection.execute("SELECT * FROM runs WHERE task_id = ?", (task_id,))]
@@ -543,6 +863,7 @@ def compare_tasks(task_ids: list[int]) -> list[dict]:
 def create_review(task_id: int, payload: ReviewCreate) -> dict:
     with connect() as connection:
         get_task(connection, task_id)
+        require_task_write(connection, task_id, {"owner", "editor", "reviewer"})
         row = connection.execute("INSERT INTO reviews(task_id, content, reviewer, created_at) VALUES (?, ?, ?, ?) RETURNING *", (task_id, payload.content, payload.reviewer, now())).fetchone()
         record_audit(connection, action="review.created", entity_type="review", entity_id=row["id"], task_id=task_id, detail={"reviewer": payload.reviewer})
         return dict(row)
@@ -583,6 +904,15 @@ def batch_markdown_report(payload: BatchReportRequest) -> str:
 @app.get("/api/memory-candidates")
 def list_candidates(status: str | None = None) -> list[dict]:
     with connect() as connection:
+        principal = current_principal()
+        if settings.profile == "production" and principal.get("global_role") != "admin":
+            if not principal.get("id"):
+                return []
+            clause = "task_id IN (SELECT task_id FROM task_memberships WHERE user_id = ?)"
+            params: list = [principal["id"]]
+            if status:
+                clause += " AND status = ?"; params.append(status)
+            return [dict(row) for row in connection.execute(f"SELECT * FROM memory_candidates WHERE {clause} ORDER BY id DESC", params)]
         if status: return [dict(row) for row in connection.execute("SELECT * FROM memory_candidates WHERE status = ? ORDER BY id DESC", (status,))]
         return [dict(row) for row in connection.execute("SELECT * FROM memory_candidates ORDER BY id DESC")]
 
@@ -590,7 +920,11 @@ def list_candidates(status: str | None = None) -> list[dict]:
 @app.post("/api/memory-candidates", status_code=201)
 def create_candidate(payload: CandidateCreate) -> dict:
     with connect() as connection:
-        if payload.task_id: get_task(connection, payload.task_id)
+        if payload.task_id:
+            get_task(connection, payload.task_id)
+            require_task_write(connection, payload.task_id)
+        elif settings.profile == "production":
+            require_admin()
         row = connection.execute("INSERT INTO memory_candidates(task_id, title, content, source_evidence, target_type, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *", (payload.task_id, payload.title, payload.content, payload.source_evidence, payload.target_type, now())).fetchone()
         return dict(row)
 
@@ -601,6 +935,10 @@ def patch_candidate(candidate_id: int, payload: CandidatePatch) -> dict:
     with connect() as connection:
         existing = connection.execute("SELECT * FROM memory_candidates WHERE id = ?", (candidate_id,)).fetchone()
         if not existing: raise HTTPException(404, "经验候选不存在")
+        if existing["task_id"]:
+            require_task_write(connection, existing["task_id"], {"owner", "editor", "reviewer"})
+        elif settings.profile == "production":
+            require_admin()
         if values:
             assignments = ", ".join(f"{key} = ?" for key in values)
             connection.execute(f"UPDATE memory_candidates SET {assignments} WHERE id = ?", [*values.values(), candidate_id])

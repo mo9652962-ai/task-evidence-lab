@@ -25,6 +25,21 @@
         }
     }
 
+    # Metrics remain behind the same OIDC boundary; restrict this path further
+    # at the FastAPI layer to admin/internal monitoring callers.
+    @metrics path /metrics
+    handle @metrics {
+        forward_auth 127.0.0.1:4180 {
+            uri /oauth2/auth
+            copy_headers X-Auth-Request-User X-Auth-Request-Email X-Auth-Request-Groups
+        }
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
     # Static Vue production build. API calls are still protected above.
     handle {
         root * ./frontend/dist

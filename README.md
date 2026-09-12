@@ -31,7 +31,8 @@ Task Evidence Lab 用于把一次任务从“提出”到“交付”之间的�
 - 交互优化：搜索标题/目标并防抖，首屏任务/模板/经验候选并行加载，结构化参数错误可被前端统一展示
 - 前端可维护性：任务列表、任务详情、任务模板和任务对比已从 `App.vue` 拆为独立组件，并各自覆盖关键交互测试
 - 本地保护：可选 `TASK_EVIDENCE_API_KEY`、进程内固定窗口限流 `TASK_EVIDENCE_RATE_LIMIT`、安全响应头和可配置 CORS；默认仍保持本地单机免鉴权
-- 公网部署第一阶段：提供 Caddy HTTPS、oauth2-proxy/OIDC 边界模板、FastAPI Trusted Host、可信代理启动参数和安全 Cookie/HSTS 配置；尚未实现业务账号、角色权限或对象级授权
+- 公网部署第二阶段：在 Caddy HTTPS 和 oauth2-proxy/OIDC 入口边界之上，增加 FastAPI 内部用户/OIDC 映射、不透明会话撤销、任务成员角色、对象级授权、Redis 限流、审计哈希链/归档和基础生产观测
+- 可选 RUM：设置 `VITE_RUM_ENDPOINT=/api/rum` 后仅上报导航耗时和页面路径，不采集任务正文、证据内容、Cookie 或完整查询参数
 
 ## 运行
 
@@ -132,4 +133,6 @@ cd backend
 
 第一阶段部署模板位于 [`deploy/`](deploy/README.md)：Caddy 负责 HTTPS 和反向代理，oauth2-proxy 负责 OIDC 登录会话，FastAPI 仅监听 `127.0.0.1`。生产 profile 必须显式配置公网 HTTPS 地址、允许 Host 和可信代理网段。
 
-该阶段只建立入口边界，不把 `X-Auth-Request-*` 代理头直接当作任务权限。用户表、会话撤销、角色/资源权限、集中式限流和生产审计将在后续阶段单独实现。
+第二阶段已经建立应用层安全闭环：`X-Auth-Request-*` 只在可信代理来源下解析，稳定 subject 映射到内部用户；任务 owner/editor/reviewer/viewer 和 admin 角色控制任务及子资源；应用会话只保存哈希 token，支持服务端撤销；生产 Redis 限流不可用时拒绝需要限流的请求；审计事件具备哈希链并可导出归档。
+
+真实域名、TLS 证书、OIDC 提供方、Redis 实例、对象存储、RUM/告警系统和双 worker 压力测试仍属于部署验收，不由本地结构测试代替。

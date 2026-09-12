@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 TaskStatus = Literal["draft", "in_progress", "blocked", "partially_verified", "completed", "archived"]
 CriterionStatus = Literal["pending", "in_progress", "verified", "failed", "not_applicable"]
 EvidenceStatus = Literal["unreviewed", "confirmed", "rejected", "outdated"]
+RumMetric = Literal["navigation", "fcp", "lcp", "cls", "inp"]
 
 
 class TaskCreate(BaseModel):
@@ -107,3 +108,9 @@ class CandidatePatch(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     content: str | None = Field(default=None, min_length=1, max_length=10000)
     reviewer_note: str | None = Field(default=None, max_length=2000)
+
+
+class RumEvent(BaseModel):
+    metric: RumMetric
+    value: float = Field(ge=0, le=3_600_000)
+    page: str = Field(default="/", min_length=1, max_length=120)
