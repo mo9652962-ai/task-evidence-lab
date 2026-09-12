@@ -210,7 +210,7 @@ def test_schema_status_reports_current_version() -> None:
         with connect() as connection:
             status = schema_status(connection)
 
-    assert status == {"current_version": 6, "latest_version": 6, "ready": True}
+    assert status == {"current_version": 7, "latest_version": 7, "ready": True}
 
 
 def test_audit_log_tracks_task_and_evidence_changes() -> None:

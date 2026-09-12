@@ -51,3 +51,7 @@ def test_production_accepts_only_trusted_proxy_identity(monkeypatch) -> None:
         assert response.status_code == 200
         assert "__Host-task_evidence_session=" in response.headers["set-cookie"]
         assert client.get("/api/auth/me").json()["global_role"] == "admin"
+        assert client.post("/api/auth/logout").status_code == 403
+        csrf = client.cookies.get("task_evidence_csrf")
+        assert csrf
+        assert client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf}).status_code == 200

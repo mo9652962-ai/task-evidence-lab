@@ -9,10 +9,11 @@ async function fetchWithTimeout(path: string, init: RequestInit, timeoutMs: numb
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
+    const csrf = typeof document !== 'undefined' ? document.cookie.split('; ').find((item) => item.startsWith('task_evidence_csrf='))?.split('=')[1] : undefined
     return await fetch(path, {
       ...init,
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+      headers: { 'Content-Type': 'application/json', ...(csrf ? { 'X-CSRF-Token': decodeURIComponent(csrf) } : {}), ...(init.headers ?? {}) },
     })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw new ApiError('请求超时，请稍后重试', 408)

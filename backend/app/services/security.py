@@ -56,9 +56,9 @@ def add_security_headers(response: Response, *, secure_transport: bool, enable_h
     return response
 
 
-def session_cookie_options(settings) -> dict[str, str | bool]:
+def session_cookie_options(settings, *, httponly: bool | None = None) -> dict[str, str | bool]:
     return {
-        "httponly": True,
+        "httponly": True if httponly is None else httponly,
         "secure": settings.session_cookie_secure,
         "samesite": settings.session_cookie_samesite,
         "path": "/",

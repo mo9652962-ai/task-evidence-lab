@@ -168,6 +168,7 @@ def init_db() -> None:
               expires_at TEXT NOT NULL,
               revoked_at TEXT,
               revoke_reason TEXT,
+              csrf_token_hash TEXT,
               ip_hash TEXT,
               user_agent_hash TEXT
             );
@@ -189,6 +190,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_memberships_user ON task_memberships(user_id, task_id);
             """
         )
+        session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(user_sessions)")}
+        if "csrf_token_hash" not in session_columns:
+            connection.execute("ALTER TABLE user_sessions ADD COLUMN csrf_token_hash TEXT")
         audit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(audit_log)")}
         for name, definition in (("actor_user_id", "INTEGER"), ("request_id", "TEXT"), ("previous_hash", "TEXT"), ("event_hash", "TEXT"), ("redaction_version", "TEXT NOT NULL DEFAULT 'v1'"), ("archived_at", "TEXT"), ("archive_batch_id", "TEXT")):
             if name not in audit_columns:

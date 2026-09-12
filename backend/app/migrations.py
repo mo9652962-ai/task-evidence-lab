@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def schema_status(connection: sqlite3.Connection) -> dict:

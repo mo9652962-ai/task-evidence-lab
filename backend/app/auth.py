@@ -86,16 +86,19 @@ def create_session(
 ) -> tuple[str, dict]:
     current = now or utcnow()
     token = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
     created_at = _iso(current)
     expires_at = _iso(current + absolute_ttl)
     connection.execute(
-        "INSERT INTO user_sessions(user_id, token_hash, created_at, last_seen_at, expires_at, ip_hash, user_agent_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, token_hash(token), created_at, created_at, expires_at, ip_hash, user_agent_hash),
+        "INSERT INTO user_sessions(user_id, token_hash, created_at, last_seen_at, expires_at, csrf_token_hash, ip_hash, user_agent_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, token_hash(token), created_at, created_at, expires_at, token_hash(csrf_token), ip_hash, user_agent_hash),
     )
     row = connection.execute("SELECT * FROM user_sessions WHERE token_hash = ?", (token_hash(token),)).fetchone()
     if not row:
         raise RuntimeError("session creation failed")
-    return token, dict(row)
+    result = dict(row)
+    result["csrf_token"] = csrf_token
+    return token, result
 
 
 def resolve_session(connection: sqlite3.Connection, token: str | None, now: datetime | None = None, idle_ttl: timedelta = SessionPolicy.idle_ttl) -> dict | None:
@@ -187,4 +190,5 @@ def authenticate_request(request, connection: sqlite3.Connection, settings) -> t
         idle_ttl=timedelta(seconds=settings.session_idle_seconds),
     )
     user["session_id"] = session["id"]
+    user["_csrf_token"] = session["csrf_token"]
     return user, token

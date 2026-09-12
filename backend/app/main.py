@@ -72,6 +72,13 @@ async def local_security_middleware(request, call_next):
             response.headers["X-Request-ID"] = request_id
             return response
         principal_token = set_principal(principal)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            csrf_cookie = request.cookies.get("task_evidence_csrf", "")
+            csrf_header = request.headers.get("X-CSRF-Token", "")
+            if not csrf_cookie or not secrets.compare_digest(csrf_cookie, csrf_header) or not principal.get("csrf_token_hash") or not secrets.compare_digest(hashlib.sha256(csrf_cookie.encode("utf-8")).hexdigest(), principal["csrf_token_hash"]):
+                response = _security_headers(JSONResponse(status_code=403, content={"detail": "缺少或无效的 CSRF token"}), request)
+                response.headers["X-Request-ID"] = request_id
+                return response
         if settings.redis_url:
             try:
                 global redis_limiter, redis_limiter_url
@@ -122,6 +129,7 @@ async def local_security_middleware(request, call_next):
             from .services.security import session_cookie_options
 
             response.set_cookie(settings.session_cookie_name, session_token, **session_cookie_options(settings), max_age=settings.session_absolute_seconds)
+            response.set_cookie("task_evidence_csrf", principal.get("_csrf_token", ""), **session_cookie_options(settings, httponly=False), max_age=settings.session_absolute_seconds)
         response = _security_headers(response, request)
         response.headers["X-Request-ID"] = request_id
         request_metrics[f"requests_total|{response.status_code}"] = request_metrics.get(f"requests_total|{response.status_code}", 0) + 1
@@ -254,6 +262,7 @@ def auth_logout(request: Request) -> JSONResponse:
             record_audit(connection, action="auth.session_revoked", entity_type="session", detail={"reason": "logout"}, request_id=getattr(request.state, "request_id", None))
     response = JSONResponse({"logged_out": True})
     response.delete_cookie(settings.session_cookie_name, path="/")
+    response.delete_cookie("task_evidence_csrf", path="/")
     return response
 
 
@@ -268,6 +277,7 @@ def auth_logout_all() -> JSONResponse:
         count = 0
     response = JSONResponse({"logged_out": True, "revoked_sessions": count})
     response.delete_cookie(settings.session_cookie_name, path="/")
+    response.delete_cookie("task_evidence_csrf", path="/")
     return response
 
 
