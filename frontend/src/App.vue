@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { startRum } from './rum'
 import { api } from './api'
 import { isBackupPayload } from './backup'
 import type { BackupPayload } from './backup'
@@ -253,7 +254,7 @@ function closeRun() { selectedRun.value = null }
 function formatBytes(size?: number) { if (size === undefined || size === null) return '未知大小'; if (size < 1024) return `${size} B`; if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`; return `${(size / (1024 * 1024)).toFixed(1)} MB` }
 const detailHandlers = { closeTaskDetail, openTaskDetail, openEditTask, archiveTask, deleteTask, runEvaluation, downloadReport, printReport, createCandidate, changeStatus, updateCriterion, addCriterion, checkEvidenceLink, verifyEvidence, addEvidence, importRun, openRun, addReview }
 
-onMounted(async () => { const [, loadedCandidates, loadedTemplates] = await Promise.all([loadTasks(), api.candidates().catch(() => []), api.templates().catch(() => [])]); candidates.value = loadedCandidates; templates.value = loadedTemplates; const hashTaskId = parseTaskHash(window.location.hash); const hashTask = hashTaskId ? tasks.value.find((task) => task.id === hashTaskId) : null; if (hashTask) { await loadTask(hashTask.id); activeView.value = 'detail' } else if (tasks.value[0]) await selectTask(tasks.value[0]) })
+onMounted(async () => { startRum(); const [, loadedCandidates, loadedTemplates] = await Promise.all([loadTasks(), api.candidates().catch(() => []), api.templates().catch(() => [])]); candidates.value = loadedCandidates; templates.value = loadedTemplates; const hashTaskId = parseTaskHash(window.location.hash); const hashTask = hashTaskId ? tasks.value.find((task) => task.id === hashTaskId) : null; if (hashTask) { await loadTask(hashTask.id); activeView.value = 'detail' } else if (tasks.value[0]) await selectTask(tasks.value[0]) })
 </script>
 
 <template>
