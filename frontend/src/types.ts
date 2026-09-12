@@ -1,0 +1,14 @@
+export type TaskStatus = 'draft' | 'in_progress' | 'blocked' | 'partially_verified' | 'completed' | 'archived'
+export type CriterionStatus = 'pending' | 'in_progress' | 'verified' | 'failed' | 'not_applicable'
+export type EvidenceStatus = 'unreviewed' | 'confirmed' | 'rejected' | 'outdated'
+
+export interface Criterion { id: number; task_id: number; title: string; required: number; status: CriterionStatus; note: string }
+export interface Evidence { id: number; task_id: number; title: string; evidence_type: string; content: string; file_path?: string; external_url?: string; source: string; verification_status: EvidenceStatus; review_note: string; created_at: string; local_path?: string; size_bytes?: number; sha256?: string; link_check_status?: string; link_checked_at?: string; link_status_code?: number; link_final_url?: string; link_error?: string }
+export interface Evaluation { completion_score: number; evidence_score: number; verification_score: number; execution_score: number; risk_score: number; overall_score: number; verified: number | boolean; human_confirmed: number | boolean; summary: string; basis?: Record<string, unknown> }
+export interface Run { id: number; executor: string; model?: string; started_at?: string; finished_at?: string; status: string; created_at: string }
+export interface RunDetail extends Run { raw_source: string; steps: Array<{ id: number; step_index: number; step_type: string; content: string; status: string }>; tool_calls: Array<{ id: number; step_index?: number; tool_name: string; input_json: string; output_summary: string; status: string; duration_ms?: number; risk_level: string }>; changed_files: Array<{ id: number; path: string; change_type: string; additions: number; deletions: number; risk_level: string }>; tests: Array<{ id: number; name: string; status: string; duration_ms?: number; output_summary: string }> }
+export interface Review { id: number; content: string; reviewer: string; created_at: string }
+export interface AuditEntry { id: number; task_id?: number; action: string; entity_type: string; entity_id?: number; detail: Record<string, unknown>; created_at: string }
+export interface Task { id: number; title: string; description: string; status: TaskStatus; priority: 'low' | 'medium' | 'high'; due_at?: string; completion_basis: string; created_at: string; updated_at: string; criteria_count?: number; evidence_count?: number; criteria: Criterion[]; evidence: Evidence[]; runs: Run[]; reviews: Review[]; evaluation: Evaluation | null }
+export interface Candidate { id: number; task_id?: number; title: string; content: string; source_evidence: string; target_type: string; status: 'pending' | 'approved' | 'rejected'; reviewer_note: string; created_at: string }
+export interface TaskTemplate { id: number; name: string; description: string; priority: 'low' | 'medium' | 'high'; completion_basis: string; criteria: string[]; evidence_types: string[]; created_at: string; updated_at: string }
