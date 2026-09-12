@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import DATABASE_PATH, connect, init_db, row_dict
@@ -23,7 +24,8 @@ from .services.importer import ImportErrorMessage, parse_run, risk_level
 from .services.link_checker import LinkCheckError, check_external_url
 from .services.reports import render_html, render_markdown
 from .services.audit import audit_row, record_audit
-from .services.security import FixedWindowLimiter
+from .services.security import FixedWindowLimiter, add_security_headers
+from .settings import AppSettings
 
 
 @asynccontextmanager
@@ -32,17 +34,16 @@ async def lifespan(_: FastAPI):
     yield
 
 
+settings = AppSettings.from_env()
 app = FastAPI(title="Task Evidence Lab API", version="0.1.0", lifespan=lifespan)
 configured_origins = [item.strip() for item in os.getenv("TASK_EVIDENCE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=configured_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 request_limiter = FixedWindowLimiter(limit=120, window_seconds=60)
 
 
-def _security_headers(response: JSONResponse | Any) -> Any:
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    return response
+def _security_headers(response: JSONResponse | Any, request) -> Any:
+    return add_security_headers(response, secure_transport=request.url.scheme == "https", enable_hsts=settings.secure_headers)
 
 
 @app.middleware("http")
@@ -51,7 +52,7 @@ async def local_security_middleware(request, call_next):
     if is_api:
         expected_key = os.getenv("TASK_EVIDENCE_API_KEY", "").strip()
         if expected_key and not secrets.compare_digest(request.headers.get("X-API-Key", ""), expected_key):
-            return _security_headers(JSONResponse(status_code=401, content={"detail": "缺少或无效的 API Key"}))
+            return _security_headers(JSONResponse(status_code=401, content={"detail": "缺少或无效的 API Key"}), request)
         try:
             configured_limit = int(os.getenv("TASK_EVIDENCE_RATE_LIMIT", "0") or "0")
         except ValueError:
@@ -63,8 +64,8 @@ async def local_security_middleware(request, call_next):
             if not request_limiter.allow(key):
                 response = JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后重试"})
                 response.headers["Retry-After"] = str(request_limiter.retry_after(key))
-                return _security_headers(response)
-    return _security_headers(await call_next(request))
+                return _security_headers(response, request)
+    return _security_headers(await call_next(request), request)
 
 
 @app.exception_handler(RequestValidationError)

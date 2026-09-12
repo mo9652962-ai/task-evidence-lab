@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from threading import Lock
 
+from starlette.responses import Response
+
 
 class FixedWindowLimiter:
     """Small process-local limiter for an optional single-host deployment."""
@@ -42,3 +44,22 @@ class FixedWindowLimiter:
         stale = [key for key, (start, _) in self._windows.items() if current - start >= self.window_seconds]
         for key in stale:
             self._windows.pop(key, None)
+
+
+def add_security_headers(response: Response, *, secure_transport: bool, enable_hsts: bool) -> Response:
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=()"
+    if enable_hsts and secure_transport:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+def session_cookie_options(settings) -> dict[str, str | bool]:
+    return {
+        "httponly": True,
+        "secure": settings.session_cookie_secure,
+        "samesite": settings.session_cookie_samesite,
+        "path": "/",
+    }

@@ -13,3 +13,6 @@ playwright-report/
 data/*.db
 data/evidence/
 backend/tests/*.db
+deploy/*.env
+!deploy/*.env.example
+deploy/Caddyfile

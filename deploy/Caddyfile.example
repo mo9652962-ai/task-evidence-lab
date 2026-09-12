@@ -1,0 +1,34 @@
+# Copy to Caddyfile and replace TASK_EVIDENCE_DOMAIN.
+# Caddy terminates HTTPS; oauth2-proxy handles the OIDC login flow.
+{$TASK_EVIDENCE_DOMAIN} {
+    encode zstd gzip
+
+    # oauth2-proxy callback and login endpoints must remain reachable without
+    # recursively passing through forward_auth.
+    @oauth2 path /oauth2/*
+    handle @oauth2 {
+        reverse_proxy 127.0.0.1:4180
+    }
+
+    # Only the API is authenticated at this boundary. The backend still must
+    # bind to loopback and must not trust arbitrary internet-supplied headers.
+    @api path /api/*
+    handle @api {
+        forward_auth 127.0.0.1:4180 {
+            uri /oauth2/auth
+            copy_headers X-Auth-Request-User X-Auth-Request-Email X-Auth-Request-Groups
+        }
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Static Vue production build. API calls are still protected above.
+    handle {
+        root * ./frontend/dist
+        try_files {path} /index.html
+        file_server
+    }
+}
