@@ -120,9 +120,8 @@ cd backend
 - 风险评分是静态提示，不等于事实判断，也不自动阻止用户操作。
 - 默认仍按本地单机运行；如需在局域网临时暴露，可设置 `TASK_EVIDENCE_API_KEY`，并按需设置 `TASK_EVIDENCE_RATE_LIMIT`（每个客户端/IP 与路径的每分钟请求数）和 `TASK_EVIDENCE_CORS_ORIGINS`。这不是完整账号、角色权限或分布式限流方案。
 
-## 后续建议
+## 📄 许可证、安全与隐私 (License, Security & Privacy)
 
-- 增加真正的多路由页面和更细的权限策略
-- 保持证据关系图的保守语义，不自动推断证据真实性或因果关系
-- 任务规模继续增长时评估中文分词/FTS5 tokenizer、搜索相关性和索引重建工具
-- 若开放公网，补充账号认证、对象级权限、集中式限流、审计留存/轮换、HTTPS 和部署级监控
+- **开源许可证**：[MIT License](LICENSE) © 2026 sora
+- **安全模型**：[SECURITY.md](SECURITY.md)（命令执行阻断、SSRF 防御、本地单机边界）
+- **隐私政策**：[PRIVACY.md](PRIVACY.md)（100% 本地优先存储、零遥测）
